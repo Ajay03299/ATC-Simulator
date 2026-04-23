@@ -1,0 +1,19 @@
+# build artifacts
+bin/
+*.o
+*.a
+
+# runtime
+logs/*.log
+/tmp/atc.sock
+/tmp/atc_handoff.fifo
+
+# editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*~
+
+# misc
+*.zip
