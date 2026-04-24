@@ -1,21 +1,13 @@
 /*
-* ATC Server - Day 2 integration
-*
-* Responsibilities:
-* - Unix domain socket listener on SOCKET_PATH
-* - Thread-per-client accept loop
-* - Shared aircraft table protected by a mutex (CONCURRENCY CONTROL)
-* - HELLO handshake with role identification
-* - Dispatch of pilot and controller commands
-* - Role-based authorization (auth.c) on every mutating command
-* - Runway mutexes (runway.c) on CLEAR_LAND / CLEAR_TAKEOFF
-* - Gate semaphore (gates.c) on TAXI / PUSHBACK
-* - Handoff notifications via named pipe (handoff.c)
-* - STATE broadcasts to radar/controller clients
-* - Clean shutdown on SIGINT (closes socket, unlinks path)
-*
-* Day 3 will add: file locking on flight log, full signal-based
-* mayday, weather alerts via SIGUSR2.
+* All required OS concepts are now implemented:
+* - Role-based authorization -> auth.c
+* - Concurrency control (mutex) -> g_aircraft_mtx, runway mutexes
+* - Concurrency control (semaphore)-> gates.c
+* - File locking -> logger.c (flock LOCK_EX/LOCK_SH)
+* - Data consistency -> mutex + atomic log appends
+* - Sockets (client-server) -> AF_UNIX on SOCKET_PATH
+* - IPC named pipe -> handoff.c (mkfifo)
+* - IPC signals -> emergency.c (SIGUSR1/SIGUSR2)
 */
 
 #include "../common/types.h"
@@ -24,6 +16,8 @@
 #include "runway.h"
 #include "gates.h"
 #include "handoff.h"
+#include "logger.h"
+#include "emergency.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,7 +31,7 @@
 #include <sys/stat.h>
 #include <time.h>
 
-/* ---- Global state (all access guarded) --- */
+/* ---- Global state (all access guarded) ----- */
 
 static Aircraft g_aircraft[MAX_AIRCRAFT];
 static int g_aircraft_count = 0;
@@ -52,7 +46,7 @@ static pthread_mutex_t g_clients_mtx = PTHREAD_MUTEX_INITIALIZER;
 static volatile sig_atomic_t g_shutdown = 0;
 static int g_listen_fd = -1;
 
-/* ---- Signal handling --- */
+/* ---- SIGINT (shutdown) handler ----- */
 
 static void on_sigint(int sig) {
 (void)sig;
@@ -85,7 +79,6 @@ break;
 pthread_mutex_unlock(&g_clients_mtx);
 }
 
-/* Non-static: handoff.c calls this via extern declaration. */
 void broadcast(const char *msg, int role_mask) {
 pthread_mutex_lock(&g_clients_mtx);
 for (int i = 0; i < g_client_count; i++) {
@@ -96,7 +89,7 @@ send_msg(g_client_fds[i], msg);
 pthread_mutex_unlock(&g_clients_mtx);
 }
 
-/* ---- Aircraft table operations (mutex-protected) ----- */
+/* ---- Aircraft table (mutex-protected) + flight log (flock) ---------- */
 
 static int aircraft_spawn(const char *callsign, int altitude) {
 pthread_mutex_lock(&g_aircraft_mtx);
@@ -120,6 +113,10 @@ a->gate = -1;
 a->last_update = time(NULL);
 int id = a->id;
 pthread_mutex_unlock(&g_aircraft_mtx);
+
+/* Log under flock(LOCK_EX). Outside the table mutex so a slow disk
+* doesn't hold up other aircraft operations. */
+log_flight("SPAWN id=%d callsign=%s altitude=%d", id, callsign, altitude);
 return id;
 }
 
@@ -147,6 +144,7 @@ if (g_aircraft[i].id == id) {
 g_aircraft[i].emergency = 1;
 g_aircraft[i].state = STATE_EMERGENCY;
 pthread_mutex_unlock(&g_aircraft_mtx);
+log_incident("MAYDAY aircraft id=%d", id);
 return 0;
 }
 }
@@ -161,6 +159,8 @@ if (g_aircraft[i].id == id) {
 g_aircraft[i].state = s;
 g_aircraft[i].controller = owner;
 pthread_mutex_unlock(&g_aircraft_mtx);
+log_flight("STATE_CHANGE id=%d state=%s owner=%s",
+id, state_name(s), role_name(owner));
 return 0;
 }
 }
@@ -175,6 +175,7 @@ if (g_aircraft[i].id == id) {
 g_aircraft[i] = g_aircraft[g_aircraft_count - 1];
 g_aircraft_count--;
 pthread_mutex_unlock(&g_aircraft_mtx);
+log_incident("KILL aircraft id=%d", id);
 return 0;
 }
 }
@@ -196,17 +197,13 @@ state_name(a->state), a->emergency);
 pthread_mutex_unlock(&g_aircraft_mtx);
 }
 
-/* ---- Command dispatch helpers ---- */
+/* ---- Command dispatch helpers ----- */
 
-/* Tokenize: pulls the first whitespace-separated word out of buf,
-* returns a pointer to the rest. Mutates buf. */
 static char *take_verb(char *buf) {
 char *sp = strchr(buf, ' ');
 if (sp) { *sp = '\0'; return sp + 1; }
 return buf + strlen(buf);
 }
-
-/* Reply helper. */
 static void reply_ok(int fd, const char *msg) {
 char out[MSG_MAX];
 snprintf(out, sizeof(out), "OK %s", msg);
@@ -218,7 +215,7 @@ snprintf(out, sizeof(out), "ERR %s", msg);
 send_msg(fd, out);
 }
 
-/* ---- Per-client handler thread ----- */
+/* ---- Per-client handler thread ------ */
 
 typedef struct {
 int fd;
@@ -235,7 +232,6 @@ char buf[MSG_MAX];
 ssize_t n;
 
 while ((n = recv_msg(fd, buf, sizeof(buf))) > 0) {
-/* Copy for parsing; we want the original for logging. */
 char work[MSG_MAX];
 strncpy(work, buf, sizeof(work));
 work[sizeof(work) - 1] = '\0';
@@ -243,13 +239,12 @@ work[sizeof(work) - 1] = '\0';
 char *verb = work;
 char *args = take_verb(work);
 
-/* Role-based authorization - deny early if role can't do this. */
 if (!is_authorized(role, verb)) {
 reply_err(fd, deny_reason(role, verb));
 continue;
 }
 
-/* ---- Pilot commands ---- */
+/* Pilot commands */
 if (!strcmp(verb, "SPAWN")) {
 char callsign[CALLSIGN_LEN]; int alt;
 if (sscanf(args, "%15s %d", callsign, &alt) != 2) {
@@ -280,7 +275,7 @@ printf("[server] !! MAYDAY id=%d\n", id);
 } else reply_err(fd, "unknown aircraft");
 }
 
-/* ---- Tower commands: runway critical section ---- */
+/* Tower commands */
 else if (!strcmp(verb, "CLEAR_LAND") || !strcmp(verb, "CLEAR_TAKEOFF")) {
 int id, rw;
 if (sscanf(args, "%d %d", &id, &rw) != 2) {
@@ -294,13 +289,12 @@ if (aircraft_set_state(id, s, ROLE_TOWER) < 0) {
 runway_release(rw);
 reply_err(fd, "unknown aircraft"); continue;
 }
+log_flight("RUNWAY_ACQUIRE runway=%d aircraft=%d verb=%s", rw, id, verb);
 char ok[64]; snprintf(ok, sizeof(ok), "%s id=%d runway=%d", verb, id, rw);
 reply_ok(fd, ok);
-
-/* Simulate runway occupancy for a couple seconds, then release.
-* Done inline so the demo shows contention clearly. */
 sleep(2);
 runway_release(rw);
+log_flight("RUNWAY_RELEASE runway=%d aircraft=%d", rw, id);
 }
 else if (!strcmp(verb, "HANDOFF_GROUND")) {
 int id = atoi(args);
@@ -311,13 +305,12 @@ handoff_post(id, ROLE_TOWER, ROLE_GROUND);
 reply_ok(fd, "handoff posted");
 }
 
-/* ---- Ground commands: gate semaphore ---- */
+/* Ground commands */
 else if (!strcmp(verb, "TAXI")) {
 int id, gate;
 if (sscanf(args, "%d %d", &id, &gate) != 2) {
 reply_err(fd, "bad TAXI args"); continue;
 }
-/* Block until a gate slot is free. */
 if (gate_acquire() < 0) { reply_err(fd, "gate_acquire failed"); continue; }
 aircraft_set_state(id, STATE_PARKED, ROLE_GROUND);
 char ok[64]; snprintf(ok, sizeof(ok), "TAXI id=%d gate=%d", id, gate);
@@ -336,7 +329,7 @@ handoff_post(id, ROLE_GROUND, ROLE_TOWER);
 reply_ok(fd, "handoff posted");
 }
 
-/* ---- Approach commands ---- */
+/* Approach commands */
 else if (!strcmp(verb, "VECTOR")) {
 int id, hdg;
 if (sscanf(args, "%d %d", &id, &hdg) != 2) {
@@ -352,7 +345,7 @@ handoff_post(id, ROLE_APPROACH, ROLE_TOWER);
 reply_ok(fd, "handoff posted");
 }
 
-/* ---- Admin commands ---- */
+/* Admin commands */
 else if (!strcmp(verb, "KILL")) {
 int id = atoi(args);
 if (aircraft_remove(id) == 0) reply_ok(fd, "aircraft removed");
@@ -364,11 +357,22 @@ snprintf(alert, sizeof(alert), "ALERT WEATHER %s", args);
 int mask = (1 << ROLE_TOWER) | (1 << ROLE_GROUND) |
 (1 << ROLE_APPROACH);
 broadcast(alert, mask);
+log_incident("WEATHER_BROADCAST by admin: %s", args);
 reply_ok(fd, "weather broadcast");
 }
 else if (!strcmp(verb, "VIEW_LOGS")) {
-/* Day 3 wires this up with flock + log file read. */
-reply_ok(fd, "logs view coming on Day 3");
+/* Read flight log under LOCK_SH - multiple admins could
+* concurrently run this without blocking each other. */
+char contents[16 * 1024];
+int nread = log_read_flights(contents, sizeof(contents));
+if (nread < 0) { reply_err(fd, "log read failed"); continue; }
+if (nread == 0) { reply_ok(fd, "flight log is empty"); continue; }
+/* Send in chunks if the log is big. For demo we just send
+* the first ~1KB tail. */
+int start = (nread > 900) ? (nread - 900) : 0;
+char out[1024];
+snprintf(out, sizeof(out), "LOGS\n%s", contents + start);
+send_msg(fd, out);
 }
 
 else if (!strcmp(verb, "PING")) {
@@ -385,12 +389,15 @@ close(fd);
 return NULL;
 }
 
-/* ---- Broadcaster thread ----- */
+/* ---- Broadcaster thread ------ */
 
 static void *broadcaster_thread(void *arg) {
 (void)arg;
 char snap[MSG_MAX];
 while (!g_shutdown) {
+/* Drain any pending signal-driven alerts (mayday / weather). */
+emergency_poll();
+
 aircraft_snapshot(snap, sizeof(snap));
 int mask = (1 << ROLE_RADAR) | (1 << ROLE_ADMIN) |
 (1 << ROLE_TOWER) | (1 << ROLE_GROUND) |
@@ -401,21 +408,25 @@ usleep(500 * 1000);
 return NULL;
 }
 
-/* ---- main -----*/
+/* ---- main ------ */
 
 int main(void) {
 srand((unsigned)time(NULL));
 
+/* SIGINT: clean shutdown. Installed BEFORE emergency_init so our
+* handler isn't overwritten by it. */
 struct sigaction sa = {0};
 sa.sa_handler = on_sigint;
 sigaction(SIGINT, &sa, NULL);
 signal(SIGPIPE, SIG_IGN);
 
-/* Initialize sync primitives and IPC. */
+/* Initialize all subsystems in dependency order. */
+logger_init();
 runway_init();
 gates_init();
 handoff_init();
 handoff_start_reader();
+emergency_init(); /* installs SIGUSR1/SIGUSR2 handlers, writes PID file */
 
 /* Socket setup. */
 unlink(SOCKET_PATH);
@@ -472,6 +483,7 @@ pthread_detach(tid);
 }
 
 printf("\n[server] shutting down\n");
+emergency_destroy();
 handoff_destroy();
 gates_destroy();
 runway_destroy();

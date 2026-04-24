@@ -9,8 +9,8 @@ LDFLAGS := -pthread
 SRC_COMMON := src/common/protocol.c
 OBJ_COMMON := $(SRC_COMMON:.c=.o)
 
-# Server-side modules (auth, runway locks, gate semaphore, handoff pipe)
-SRC_SERVER_EXTRA :=     src/server/auth.c     src/server/runway.c     src/server/gates.c     src/server/handoff.c
+# Server-side modules (auth, runway, gates, handoff pipe, logger, signals)
+SRC_SERVER_EXTRA :=     src/server/auth.c     src/server/runway.c     src/server/gates.c     src/server/handoff.c     src/server/logger.c     src/server/emergency.c
 OBJ_SERVER_EXTRA := $(SRC_SERVER_EXTRA:.c=.o)
 
 BINS := bin/atc_server bin/pilot bin/radar bin/controller
@@ -38,6 +38,6 @@ bin/controller: src/clients/controller.c $(OBJ_COMMON) | bin
 
 clean:
 	rm -rf bin src/common/*.o src/server/*.o logs/*.log
-	rm -f /tmp/atc.sock /tmp/atc_handoff.fifo
+	rm -f /tmp/atc.sock /tmp/atc_handoff.fifo /tmp/atc_server.pid
 
 .PHONY: all clean
