@@ -1,10 +1,9 @@
 # ATC Simulator
 
-A multi-controller air traffic control simulator written in C. Built for
-**EGC 301P / Operating Systems Lab**.
+A multi-controller air traffic control simulator written in C. 
 
-Everything runs locally — the "network" is a Unix domain socket and the
-"different systems" are different terminal tabs. Keeps things simple and
+Everything runs locally — the network is a Unix domain socket and the
+different systems are different terminal tabs. Keeps things simple and
 lets you actually stress-test concurrency.
 
 ## What it does
